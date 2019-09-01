@@ -36,6 +36,7 @@
 #include "llvm/Option/Option.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/LEB128.h"
+#include "llvm/Support/MathExtras.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/Process.h"
 #include "llvm/Support/TarWriter.h"
@@ -62,16 +63,16 @@ LinkerDriver *driver;
 bool link(ArrayRef<const char *> args, bool canExitEarly, raw_ostream &diag) {
   errorHandler().logName = args::getFilenameWithoutExe(args[0]);
   errorHandler().errorOS = &diag;
-  errorHandler().colorDiagnostics = diag.has_colors();
   errorHandler().errorLimitExceededMsg =
       "too many errors emitted, stopping now"
       " (use /errorlimit:0 to see all errors)";
   errorHandler().exitEarly = canExitEarly;
+  enableColors(diag.has_colors());
+
   config = make<Configuration>();
-
   symtab = make<SymbolTable>();
-
   driver = make<LinkerDriver>();
+
   driver->link(args);
 
   // Call exit() if we can to avoid calling destructors.
@@ -184,8 +185,10 @@ void LinkerDriver::addBuffer(std::unique_ptr<MemoryBuffer> mb,
     if (wholeArchive) {
       std::unique_ptr<Archive> file =
           CHECK(Archive::create(mbref), filename + ": failed to parse archive");
+      Archive *archive = file.get();
+      make<std::unique_ptr<Archive>>(std::move(file)); // take ownership
 
-      for (MemoryBufferRef m : getArchiveMembers(file.get()))
+      for (MemoryBufferRef m : getArchiveMembers(archive))
         addArchiveBuffer(m, "<whole-archive>", filename, 0);
       return;
     }
@@ -988,30 +991,37 @@ static void parsePDBAltPath(StringRef altPath) {
   config->pdbAltPath = buf;
 }
 
-/// Check that at most one resource obj file was used.
+/// Convert resource files and potentially merge input resource object
+/// trees into one resource tree.
 /// Call after ObjFile::Instances is complete.
-static void diagnoseMultipleResourceObjFiles() {
-  // The .rsrc$01 section in a resource obj file contains a tree description
-  // of resources.  Merging multiple resource obj files would require merging
-  // the trees instead of using usual linker section merging semantics.
-  // Since link.exe disallows linking more than one resource obj file with
-  // LNK4078, mirror that.  The normal use of resource files is to give the
-  // linker many .res files, which are then converted to a single resource obj
-  // file internally, so this is not a big restriction in practice.
-  ObjFile *resourceObjFile = nullptr;
+void LinkerDriver::convertResources() {
+  std::vector<ObjFile *> resourceObjFiles;
+
   for (ObjFile *f : ObjFile::instances) {
-    if (!f->isResourceObjFile)
-      continue;
-
-    if (!resourceObjFile) {
-      resourceObjFile = f;
-      continue;
-    }
-
-    error(toString(f) +
-          ": more than one resource obj file not allowed, already got " +
-          toString(resourceObjFile));
+    if (f->isResourceObjFile())
+      resourceObjFiles.push_back(f);
   }
+
+  if (!config->mingw &&
+      (resourceObjFiles.size() > 1 ||
+       (resourceObjFiles.size() == 1 && !resources.empty()))) {
+    error((!resources.empty() ? "internal .obj file created from .res files"
+                              : toString(resourceObjFiles[1])) +
+          ": more than one resource obj file not allowed, already got " +
+          toString(resourceObjFiles.front()));
+    return;
+  }
+
+  if (resources.empty() && resourceObjFiles.size() <= 1) {
+    // No resources to convert, and max one resource object file in
+    // the input. Keep that preconverted resource section as is.
+    for (ObjFile *f : resourceObjFiles)
+      f->includeResourceChunks();
+    return;
+  }
+  ObjFile *f = make<ObjFile>(convertResToCOFF(resources, resourceObjFiles));
+  symtab->addFile(f);
+  f->includeResourceChunks();
 }
 
 // In MinGW, if no symbols are chosen to be exported, then all symbols are
@@ -1051,6 +1061,12 @@ void LinkerDriver::maybeExportMinGWSymbols(const opt::InputArgList &args) {
     config->exports.push_back(e);
   });
 }
+
+static const char *libcallRoutineNames[] = {
+#define HANDLE_LIBCALL(code, name) name,
+#include "llvm/IR/RuntimeLibcalls.def"
+#undef HANDLE_LIBCALL
+};
 
 void LinkerDriver::link(ArrayRef<const char *> argsArr) {
   // Needed for LTO.
@@ -1420,6 +1436,13 @@ void LinkerDriver::link(ArrayRef<const char *> argsArr) {
   for (auto *arg : args.filtered(OPT_section))
     parseSection(arg->getValue());
 
+  // Handle /align
+  if (auto *arg = args.getLastArg(OPT_align)) {
+    parseNumbers(arg->getValue(), &config->align);
+    if (!isPowerOf2_64(config->align))
+      error("/align: not a power of two: " + StringRef(arg->getValue()));
+  }
+
   // Handle /aligncomm
   for (auto *arg : args.filtered(OPT_aligncomm))
     parseAligncomm(arg->getValue());
@@ -1465,6 +1488,7 @@ void LinkerDriver::link(ArrayRef<const char *> argsArr) {
       getOldNewOptions(args, OPT_thinlto_prefix_replace);
   config->thinLTOObjectSuffixReplace =
       getOldNewOptions(args, OPT_thinlto_object_suffix_replace);
+  config->ltoObjPath = args.getLastArgValue(OPT_lto_obj_path);
   // Handle miscellaneous boolean flags.
   config->allowBind = args.hasFlag(OPT_allowbind, OPT_allowbind_no, true);
   config->allowIsolation =
@@ -1565,12 +1589,6 @@ void LinkerDriver::link(ArrayRef<const char *> argsArr) {
   // Handle /functionpadmin
   for (auto *arg : args.filtered(OPT_functionpadmin, OPT_functionpadmin_opt))
     parseFunctionPadMin(arg, config->machine);
-
-  // Input files can be Windows resource files (.res files). We use
-  // WindowsResource to convert resource files to a regular COFF file,
-  // then link the resulting file normally.
-  if (!resources.empty())
-    symtab->addFile(make<ObjFile>(convertResToCOFF(resources)));
 
   if (tar)
     tar->append("response.txt",
@@ -1747,6 +1765,15 @@ void LinkerDriver::link(ArrayRef<const char *> argsArr) {
           u->weakAlias = symtab->addUndefined(to);
     }
 
+    // If any inputs are bitcode files, the LTO code generator may create
+    // references to library functions that are not explicit in the bitcode
+    // file's symbol table. If any of those library functions are defined in a
+    // bitcode file in an archive member, we need to arrange to use LTO to
+    // compile those archive members by adding them to the link beforehand.
+    if (!BitcodeFile::instances.empty())
+      for (const char *s : libcallRoutineNames)
+        symtab->addLibcall(s);
+
     // Windows specific -- if __load_config_used can be resolved, resolve it.
     if (symtab->findUnderscore("_load_config_used"))
       addUndefined(mangle("_load_config_used"));
@@ -1807,6 +1834,7 @@ void LinkerDriver::link(ArrayRef<const char *> argsArr) {
   if (errorCount())
     return;
 
+  config->hadExplicitExports = !config->exports.empty();
   if (config->mingw) {
     // In MinGW, all symbols are automatically exported if no symbols
     // are chosen to be exported.
@@ -1830,10 +1858,12 @@ void LinkerDriver::link(ArrayRef<const char *> argsArr) {
   }
 
   // Windows specific -- when we are creating a .dll file, we also
-  // need to create a .lib file.
+  // need to create a .lib file. In MinGW mode, we only do that when the
+  // -implib option is given explicitly, for compatibility with GNU ld.
   if (!config->exports.empty() || config->dll) {
     fixupExports();
-    createImportLibrary(/*asLib=*/false);
+    if (!config->mingw || !config->implib.empty())
+      createImportLibrary(/*asLib=*/false);
     assignExportOrdinals();
   }
 
@@ -1877,7 +1907,7 @@ void LinkerDriver::link(ArrayRef<const char *> argsArr) {
     markLive(symtab->getChunks());
 
   // Needs to happen after the last call to addFile().
-  diagnoseMultipleResourceObjFiles();
+  convertResources();
 
   // Identify identical COMDAT sections to merge them.
   if (config->doICF) {

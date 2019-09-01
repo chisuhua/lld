@@ -185,6 +185,8 @@ void SymbolTable::loadMinGWAutomaticImports() {
       continue;
     if (!sym->isUsedInRegularObj)
       continue;
+    if (undef->getWeakAlias())
+      continue;
 
     StringRef name = undef->getName();
 
@@ -326,7 +328,7 @@ void SymbolTable::reportUnresolvable() {
     auto *undef = dyn_cast<Undefined>(sym);
     if (!undef)
       continue;
-    if (Defined *d = undef->getWeakAlias())
+    if (undef->getWeakAlias())
       continue;
     StringRef name = undef->getName();
     if (name.startswith("__imp_")) {
@@ -580,6 +582,18 @@ Symbol *SymbolTable::addImportThunk(StringRef name, DefinedImportData *id,
 
   reportDuplicate(s, id->file);
   return nullptr;
+}
+
+void SymbolTable::addLibcall(StringRef name) {
+  Symbol *sym = findUnderscore(name);
+  if (!sym)
+    return;
+
+  if (Lazy *l = dyn_cast<Lazy>(sym)) {
+    MemoryBufferRef mb = l->getMemberBuffer();
+    if (identify_magic(mb.getBuffer()) == llvm::file_magic::bitcode)
+      addUndefined(sym->getName());
+  }
 }
 
 std::vector<Chunk *> SymbolTable::getChunks() {

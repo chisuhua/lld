@@ -47,7 +47,6 @@ class Defined;
 class DefinedImportData;
 class DefinedImportThunk;
 class DefinedRegular;
-class Lazy;
 class SectionChunk;
 class Symbol;
 class Undefined;
@@ -135,6 +134,10 @@ public:
     return symbols.size() - 1;
   }
 
+  void includeResourceChunks();
+
+  bool isResourceObjFile() const { return !resourceChunks.empty(); }
+
   static std::vector<ObjFile *> instances;
 
   // Flags in the absolute @feat.00 symbol if it is present. These usually
@@ -161,9 +164,6 @@ public:
   // The same key is used by both the precompiled object, and objects using the
   // precompiled object. Any difference indicates out-of-date objects.
   llvm::Optional<uint32_t> pchSignature;
-
-  // Whether this is an object file created from .res files.
-  bool isResourceObjFile = false;
 
   // Whether this file was compiled with /hotpatch.
   bool hotPatchable = false;
@@ -233,6 +233,8 @@ private:
   // List of all chunks defined by this file. This includes both section
   // chunks and non-section chunks for common symbols.
   std::vector<Chunk *> chunks;
+
+  std::vector<SectionChunk *> resourceChunks;
 
   // CodeView debug info sections.
   std::vector<SectionChunk *> debugChunks;
